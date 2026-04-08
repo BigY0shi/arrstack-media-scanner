@@ -1,505 +1,326 @@
 #!/usr/bin/env python3
 """
-arrstack-media-scanner  —  Dry Run Reporter
-============================================
-Scans a self-hosted media library and produces 5 JSON reports:
+arrstack-media-scanner  v2.0  --  Dry-Run Report Engine
+=======================================================
+Produces up to 5 structured JSON reports for a self-hosted media library.
+All operations are READ-ONLY; nothing is moved, renamed, or deleted.
 
-  1. stray_files       — files not inside the expected subfolder structure
-  2. duplicates_name   — duplicate groups matched by parsed title + resolution
-                         (strips codec, studio, source, streaming-service tags)
-  3. duplicates_hash   — exact byte-for-byte duplicates via partial MD5
-  4. non_hd            — media titles with no 720p+ version
-  5. non_english       — files with no English audio track
+Reports
+-------
+  1. stray_files        -- files sitting outside the expected hierarchy
+  2. duplicates_by_name -- groups with same parsed title + resolution
+  3. duplicates_by_hash -- byte-identical files (partial-MD5 fingerprint)
+  4. non_hd             -- video titles with no 720p+ copy
+  5. non_english        -- files with no detectable English audio
 
-All checks are READ-ONLY. Nothing is moved or deleted.
+Configuration (environment variables)
+--------------------------------------
+  MEDIA_ROOT      parent of all category dirs  (default /mnt/media)
+  REPORT_DIR      where JSON reports are saved  (default /mnt/reports)
 
-Expected volume mounts
------------------------
-  /mnt/media/shows
-  /mnt/media/movies
-  /mnt/media/anime
-  /mnt/media/books
-  /mnt/media/audiobooks
-  (optional) /mnt/media/music
+  Per-category override paths (optional):
+    MEDIA_SHOWS        MEDIA_MOVIES       MEDIA_ANIME
+    MEDIA_BOOKS        MEDIA_AUDIOBOOKS   MEDIA_MUSIC
 
-Reports are written to /mnt/reports/ with a UTC timestamp prefix.
+  Check toggles (set to '0' to skip a check):
+    CHECK_STRAY_FILES        CHECK_DUPLICATES_BY_NAME
+    CHECK_DUPLICATES_BY_HASH CHECK_NON_HD   CHECK_NON_ENGLISH
+
+  Filtering:
+    MIN_HD_HEIGHT   minimum pixel height for 'HD' (default 720)
+    PARTIAL_MB      MB read from head+tail for hash (default 4)
 """
 
-import os
-import re
-import json
-import hashlib
-import subprocess
-from pathlib import Path
+from __future__ import annotations
+import hashlib, json, os, re, subprocess
 from collections import defaultdict
 from datetime import datetime, timezone
+from pathlib import Path
+from typing import Optional
 
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
-MEDIA_ROOT = Path("/mnt/media")
-REPORT_DIR = Path("/mnt/reports")
 
-MEDIA_DIRS = {
-    "shows":      MEDIA_ROOT / "shows",
-    "movies":     MEDIA_ROOT / "movies",
-    "anime":      MEDIA_ROOT / "anime",
-    "books":      MEDIA_ROOT / "books",
-    "audiobooks": MEDIA_ROOT / "audiobooks",
-    "music":      MEDIA_ROOT / "music",
+def _env_path(var, fallback): return Path(os.getenv(var, fallback))
+def _env_bool(var, default=True):
+    v = os.getenv(var, '')
+    return default if not v else v.strip().lower() not in ('0','false','no','off')
+def _env_int(var, default):
+    try: return int(os.getenv(var, str(default)))
+    except ValueError: return default
+
+MEDIA_ROOT    = _env_path('MEDIA_ROOT', '/mnt/media')
+REPORT_DIR    = _env_path('REPORT_DIR', '/mnt/reports')
+MIN_HD_HEIGHT = _env_int('MIN_HD_HEIGHT', 720)
+PARTIAL_MB    = _env_int('PARTIAL_MB', 4)
+
+# (env_override, is_video, is_audio)
+CATEGORIES = {
+    'shows':      ('MEDIA_SHOWS',      True,  False),
+    'movies':     ('MEDIA_MOVIES',     True,  False),
+    'anime':      ('MEDIA_ANIME',      True,  False),
+    'books':      ('MEDIA_BOOKS',      False, False),
+    'audiobooks': ('MEDIA_AUDIOBOOKS', False, True),
+    'music':      ('MEDIA_MUSIC',      False, True),
 }
 
-VIDEO_EXTS  = {".mkv", ".mp4", ".avi", ".m4v", ".mov", ".wmv", ".ts", ".m2ts"}
-AUDIO_EXTS  = {".flac", ".mp3", ".m4a", ".aac", ".ogg", ".wav", ".opus", ".wma"}
-BOOK_EXTS   = {".epub", ".mobi", ".pdf", ".azw", ".azw3", ".cbz", ".cbr"}
-MEDIA_EXTS  = VIDEO_EXTS | AUDIO_EXTS | BOOK_EXTS
+def get_category_path(name):
+    return _env_path(CATEGORIES[name][0], str(MEDIA_ROOT / name))
 
-# Resolution tiers — evaluated in order (highest first)
-RESOLUTION_TIERS = [
-    (r'\b(2160p|4K|UHD)\b',    2160),
-    (r'\b(1080p|1080i|FHD)\b', 1080),
-    (r'\b(720p|720i|HD)\b',     720),
-    (r'\b(480p|SD)\b',          480),
-    (r'\b(360p)\b',             360),
-]
+CHECK_STRAY_FILES        = _env_bool('CHECK_STRAY_FILES')
+CHECK_DUPLICATES_BY_NAME = _env_bool('CHECK_DUPLICATES_BY_NAME')
+CHECK_DUPLICATES_BY_HASH = _env_bool('CHECK_DUPLICATES_BY_HASH')
+CHECK_NON_HD             = _env_bool('CHECK_NON_HD')
+CHECK_NON_ENGLISH        = _env_bool('CHECK_NON_ENGLISH')
 
-# Filename language tags that suggest non-English-only content
-NON_ENGLISH_LANG_TAGS = [
-    r'\b(french|francais|vff|vf)\b',
-    r'\b(german|deutsch|ger)\b',
-    r'\b(spanish|espanol|esp|spa)\b',
-    r'\b(portuguese|portugues|por)\b',
-    r'\b(italian|italiano|ita)\b',
-    r'\b(japanese|japonais|jpn)\b',
-    r'\b(chinese|mandarin|chn|chi)\b',
-    r'\b(korean|kor)\b',
-    r'\b(arabic|ara)\b',
-    r'\b(russian|rus)\b',
-    r'\b(hindi|hin)\b',
-    r'\b(turkish|tur)\b',
-    r'\b(dutch|nld)\b',
-    r'\b(polish|pol)\b',
-]
+VIDEO_EXT = {'.mkv','.mp4','.avi','.m4v','.ts','.mov','.wmv','.flv','.webm'}
+AUDIO_EXT = {'.mp3','.flac','.m4a','.ogg','.opus','.wav','.aac','.wma','.alac'}
+BOOK_EXT  = {'.epub','.mobi','.azw','.azw3','.pdf','.cbz','.cbr','.fb2'}
+MEDIA_EXT = VIDEO_EXT | AUDIO_EXT | BOOK_EXT
+def is_media(p): return p.suffix.lower() in MEDIA_EXT
 
-# Non-Latin Unicode ranges (Cyrillic, Arabic, Devanagari, CJK, Korean)
 NON_LATIN_RE = re.compile(
-    r'[\u0400-\u04FF'
-    r'\u0600-\u06FF'
-    r'\u0900-\u097F'
-    r'\u3000-\u9FFF'
-    r'\uAC00-\uD7AF]'
+    r'[\u0400-\u04ff\u0600-\u06ff\u4e00-\u9fff\u3040-\u309f'
+    r'\u30a0-\u30ff\uac00-\ud7af\u0900-\u097f\u0e00-\u0e7f]'
 )
+_JUNK_RE = re.compile(
+    r'\b(\d{4}|webrip|web[- ]rip|webdl|web[- ]dl|bluray|blu[- ]ray|bdrip|hdrip'
+    r'|dvdrip|hdtv|remux|amzn|nf|hulu|dsnp|atvp|pcok|pmtp|hbo|peacock|paramount'
+    r'|repack|proper|extended|theatrical|directors|unrated|hybrid'
+    r'|x264|x265|h264|h265|hevc|avc|xvid|divx|av1|vp9'
+    r'|aac|ac3|dts|truehd|atmos|ddp|dd5|flac|mp3|eac3'
+    r'|10bit|12bit|hdr|hdr10|dv|dolby|vision|sdr|hlg'
+    r'|2160p|1080p|1080i|720p|720i|480p|576p|4k|uhd|fhd|hd'
+    r'|multi|dubbed|subbed|remastered|restored|criterion'
+    r'|s\d{2}e\d{2}|s\d{2}e\d{2}-e\d{2}|s\d{2})\b', re.IGNORECASE)
+_RES_RE = re.compile(r'\b(2160p|4k|uhd|1080p|1080i|720p|720i|480p|576p)\b', re.IGNORECASE)
+_HEIGHT_MAP = {'2160p':2160,'4k':2160,'uhd':2160,'1080p':1080,'1080i':1080,
+               '720p':720,'720i':720,'480p':480,'576p':576}
 
-
-# ---------------------------------------------------------------------------
-# Filename parsing helpers
-# ---------------------------------------------------------------------------
-
-def get_resolution(filename: str) -> int:
-    """Return the numeric resolution from a filename, or 0 if not found."""
-    for pattern, res in RESOLUTION_TIERS:
-        if re.search(pattern, filename, re.IGNORECASE):
-            return res
-    return 0
-
-
-def parse_media_title(filename: str) -> str:
-    """
-    Strip release metadata and return a normalised, comparable title string.
-
-    Examples
-    --------
-    'Movie.A.Webrip.AMZ.1080p.PRODUCE.mkv'  ->  'movie a'
-    'MOVIE.A.HDRIP.720P.YAHOO.mkv'           ->  'movie a'
-    'Show.Name.S02E05.WEB-DL.x265.mkv'       ->  'show name'
-    """
-    stem = Path(filename).stem
-    name = re.sub(r'[._]', ' ', stem)          # dots/underscores -> spaces
-
-    # Cut everything from the first "junk" token onward
-    junk = (
-        r'\b(\d{4}|'                          # year
-        r'webrip|web[- ]rip|webdl|web[- ]dl|'
-        r'bluray|blu[- ]ray|bdrip|hdrip|dvdrip|hdtv|'
-        r'amzn|nf|hulu|dsnp|atvp|pcok|pmtp|'
-        r'repack|proper|extended|theatrical|directors|unrated|'
-        r'x264|x265|h264|h265|hevc|avc|xvid|divx|'
-        r'aac|ac3|dts|truehd|atmos|ddp|dd5|'
-        r'10bit|hdr|hdr10|dv|dolby|vision|'
-        r'2160p|1080p|1080i|720p|720i|480p|4k|uhd|fhd|'
-        r'multi|dubbed|subbed|remastered|restored|'
-        r's\d{2}e\d{2}|s\d{2}|e\d{2})\b'
-    )
-    m = re.search(junk, name, re.IGNORECASE)
-    if m:
-        name = name[:m.start()]
-    return name.strip().lower()
-
-
-def get_season(filename: str) -> str | None:
-    """Extract a normalised season string (e.g. 'S02') from a filename."""
-    m = re.search(r'\b[Ss](\d{1,2})\b', filename)
-    return f"S{int(m.group(1)):02d}" if m else None
-
+def parse_resolution(fn):
+    m = _RES_RE.search(fn); return m.group(0).lower() if m else None
+def resolution_height(res):
+    return 0 if res is None else _HEIGHT_MAP.get(res.lower(), 0)
+def parse_media_title(fn):
+    name = re.sub(r'[._ -]+', ' ', Path(fn).stem)
+    m = _JUNK_RE.search(name)
+    return (name[:m.start()] if m else name).strip().lower()
+def get_season(fn):
+    m = re.search(r'\b[Ss](\d{1,2})\b', fn)
+    return f'S{int(m.group(1)):02d}' if m else None
 
 # ---------------------------------------------------------------------------
-# File hashing
+# Hashing
 # ---------------------------------------------------------------------------
-
-def partial_md5(path: Path, chunk: int = 4 * 1024 * 1024) -> str:
-    """
-    Fast approximate hash using filesize + first 4 MB + last 4 MB.
-    Sufficient for exact-duplicate detection without reading whole files.
-    """
-    h = hashlib.md5()
-    size = path.stat().st_size
-    h.update(str(size).encode())
-    with open(path, 'rb') as fh:
-        h.update(fh.read(chunk))
-        if size > chunk * 2:
-            fh.seek(-chunk, 2)
+def partial_md5(path):
+    chunk = PARTIAL_MB * 1_048_576; h = hashlib.md5()
+    try:
+        size = path.stat().st_size
+        with open(path,'rb') as fh:
             h.update(fh.read(chunk))
+            if size > chunk*2: fh.seek(-chunk,2); h.update(fh.read(chunk))
+        h.update(str(size).encode())
+    except OSError: pass
     return h.hexdigest()
 
-
 # ---------------------------------------------------------------------------
-# Language detection
+# ffprobe
 # ---------------------------------------------------------------------------
-
-def ffprobe_audio_langs(path: Path) -> list[str]:
-    """Return a list of audio-stream language codes reported by ffprobe."""
+def ffprobe_audio_langs(path):
     try:
-        result = subprocess.run(
-            ['ffprobe', '-v', 'quiet',
-             '-print_format', 'json',
-             '-show_streams', '-select_streams', 'a',
-             str(path)],
-            capture_output=True, text=True, timeout=30
-        )
-        data = json.loads(result.stdout)
-        langs = []
-        for stream in data.get('streams', []):
-            tags = stream.get('tags', {})
-            lang = tags.get('language', tags.get('LANGUAGE', 'und')).lower()
-            langs.append(lang)
-        return langs
-    except Exception:
-        return []
+        r = subprocess.run(['ffprobe','-v','quiet','-print_format','json',
+            '-show_streams','-select_streams','a',str(path)],
+            capture_output=True, text=True, timeout=30)
+        data = json.loads(r.stdout)
+        return [s.get('tags',{}).get('language',s.get('tags',{}).get('LANGUAGE','und')).lower()
+                for s in data.get('streams',[])]
+    except Exception: return []
 
-
-def has_english_audio(path: Path) -> bool:
-    """
-    True if the file has at least one English audio track.
-    Returns True (assume OK) when ffprobe cannot determine language.
-    """
+def has_english_audio(path):
     langs = ffprobe_audio_langs(path)
-    if not langs:
-        return True
-    return any(lang in ('eng', 'en', 'english', 'und') for lang in langs)
+    return True if not langs else any(l in ('eng','en','english','und') for l in langs)
 
-
-def non_english_filename_reason(filename: str) -> str | None:
-    """
-    Return a human-readable reason string if the filename strongly suggests
-    non-English-only content, otherwise None.
-    """
-    if NON_LATIN_RE.search(filename):
-        return 'non-Latin characters in filename'
-    stem = filename.lower()
-    eng_present = re.search(r'\b(english|eng)\b', stem)
-    if not eng_present:
-        for pat in NON_ENGLISH_LANG_TAGS:
-            if re.search(pat, stem, re.IGNORECASE):
-                return f'language tag matched pattern: {pat}'
+def non_english_filename_reason(fn):
+    if NON_LATIN_RE.search(fn): return 'non-Latin characters in filename'
+    stem = fn.lower()
+    if re.search(r'\b(english|eng)\b', stem): return None
+    for tag in ('.fre.','.ger.','.spa.','.ita.','.por.','.rus.','.jpn.',
+                '.kor.','.chi.','.ara.','.hin.','.pol.','.dut.','.swe.',
+                '.nor.','.fin.','.dan.','.tur.','.heb.','.vie.',
+                'french','german','spanish','italian','portuguese',
+                'russian','japanese','korean','chinese','arabic'):
+        if tag in stem: return f"language tag '{tag.strip('.')}' in filename"
     return None
 
+# ---------------------------------------------------------------------------
+# Walkers
+# ---------------------------------------------------------------------------
+def walk_media_files(base):
+    if not base.exists(): return []
+    return [p for p in base.rglob('*') if p.is_file() and is_media(p)]
 
 # ---------------------------------------------------------------------------
-# File collection
+# Report 1 -- Stray files
 # ---------------------------------------------------------------------------
+def _depth(base, f): return len(f.relative_to(base).parts) - 1
 
-def collect_media_files(base_dir: Path) -> list[Path]:
-    """Recursively collect all recognised media files under base_dir."""
-    if not base_dir.exists():
-        return []
-    return [p for p in base_dir.rglob('*')
-            if p.is_file() and p.suffix.lower() in MEDIA_EXTS]
-
-
-# ---------------------------------------------------------------------------
-# Report generators
-# ---------------------------------------------------------------------------
-
-def report_stray_files(category: str, base_dir: Path) -> list[dict]:
-    """
-    Files sitting in the wrong level of the hierarchy.
-
-    Expected layouts
-    ----------------
-    shows / anime  ->  SeriesName / Season XX / episode.ext
-    movies         ->  MovieName  / movie.ext
-    books          ->  Author     / Title / book.ext   (or Author / book.ext)
-    audiobooks     ->  Author     / Title / track.ext
-    music          ->  Artist     / Album / track.ext
-    """
-    if not base_dir.exists():
-        return []
-    stray = []
-
-    for item in base_dir.iterdir():
-        # File directly in the category root — always stray
-        if item.is_file() and item.suffix.lower() in MEDIA_EXTS:
-            stray.append({
-                'file': str(item.relative_to(MEDIA_ROOT)),
-                'size_mb': round(item.stat().st_size / 1_048_576, 2),
-                'issue': f'File is in /{category}/ root — should be inside a subfolder',
-                'suggested_folder': None,
-            })
-
-        # For shows/anime: video file directly inside the series folder
-        elif item.is_dir() and category in ('shows', 'anime'):
-            for f in item.iterdir():
-                if f.is_file() and f.suffix.lower() in VIDEO_EXTS:
-                    season = get_season(f.name)
-                    s_num = int(season[1:]) if season else None
-                    suggested = (
-                        f"{item.name}/Season {s_num:02d}" if s_num is not None
-                        else f"{item.name}/Season ??"
-                    )
-                    stray.append({
-                        'file': str(f.relative_to(MEDIA_ROOT)),
-                        'size_mb': round(f.stat().st_size / 1_048_576, 2),
-                        'issue': 'Video file is in series root — should be in a Season subfolder',
-                        'suggested_folder': suggested,
-                    })
-    return stray
-
-
-def report_duplicates_by_name(category: str, base_dir: Path) -> list[dict]:
-    """
-    Group files by (normalised_title, season).  Groups with more than one
-    file are reported as potential duplicates.
-
-    The highest-resolution copy is marked KEEP; others are marked REVIEW.
-    """
-    if not base_dir.exists():
-        return []
-    groups: dict[tuple, list[dict]] = defaultdict(list)
-
-    for f in collect_media_files(base_dir):
-        title  = parse_media_title(f.name)
-        season = get_season(f.name) or ''
-        res    = get_resolution(f.name)
-        groups[(title, season)].append({'path': f, 'res': res})
-
+def report_stray_files(cat, base):
     results = []
-    for (title, season), entries in groups.items():
-        if len(entries) < 2:
-            continue
-        ranked = sorted(entries, key=lambda x: x['res'], reverse=True)
-        results.append({
-            'parsed_title': title,
-            'season':       season or None,
-            'file_count':   len(entries),
-            'files': [
-                {
-                    'file':       str(e['path'].relative_to(MEDIA_ROOT)),
-                    'size_mb':    round(e['path'].stat().st_size / 1_048_576, 2),
-                    'resolution': e['res'] or 'unknown',
-                    'action':     'KEEP (highest quality)' if i == 0 else 'REVIEW for removal',
-                }
-                for i, e in enumerate(ranked)
-            ],
-        })
+    for f in walk_media_files(base):
+        d = _depth(base, f); reason = None
+        if cat in ('shows','anime'):
+            if d == 0: reason = 'Directly in category root (missing show folder)'
+            elif d > 3: reason = f'Unexpectedly deep nesting (depth {d})'
+        elif cat == 'movies':
+            if d > 2: reason = f'Unexpectedly deep nesting (depth {d})'
+        elif cat in ('books','audiobooks'):
+            if d == 0: reason = 'Directly in category root (missing author/title folder)'
+        elif cat == 'music':
+            if d < 2: reason = 'Missing artist or album subfolder'
+        if reason:
+            results.append({'category':cat,'file':str(f.relative_to(base.parent)),
+                            'depth':d,'reason':reason,'size_mb':round(f.stat().st_size/1_048_576,2)})
     return results
 
-
-def report_duplicates_by_hash(category: str, base_dir: Path) -> list[dict]:
-    """
-    Group files by partial MD5.  Any group with >1 member contains exact
-    byte-for-byte duplicates.  The largest file in each group is kept.
-    """
-    if not base_dir.exists():
-        return []
-    hash_map: dict[str, list[Path]] = defaultdict(list)
-
-    for f in collect_media_files(base_dir):
-        try:
-            hash_map[partial_md5(f)].append(f)
-        except OSError:
-            pass
-
+# ---------------------------------------------------------------------------
+# Report 2 -- Duplicates by name
+# ---------------------------------------------------------------------------
+def report_duplicates_by_name(cat, base):
+    groups = defaultdict(list)
+    for f in walk_media_files(base):
+        t = parse_media_title(f.name); s = get_season(f.name) or ''
+        if t: groups[f'{cat}|{t}|{s}'].append(f)
     results = []
-    for h, group in hash_map.items():
-        if len(group) < 2:
-            continue
-        ranked = sorted(group, key=lambda f: f.stat().st_size, reverse=True)
-        results.append({
-            'hash':       h,
-            'file_count': len(group),
-            'files': [
-                {
-                    'file':    str(f.relative_to(MEDIA_ROOT)),
-                    'size_mb': round(f.stat().st_size / 1_048_576, 2),
-                    'action':  'KEEP' if i == 0 else 'EXACT DUPLICATE — safe to remove',
-                }
-                for i, f in enumerate(ranked)
-            ],
-        })
+    for key, files in groups.items():
+        if len(files) < 2: continue
+        _, title, season = key.split('|',2)
+        ranked = sorted(files, key=lambda p: resolution_height(parse_resolution(p.name)), reverse=True)
+        results.append({'category':cat,'parsed_title':title,'season':season or None,
+            'file_count':len(ranked),'files':[
+                {'file':str(f.relative_to(base.parent)),'resolution':parse_resolution(f.name),
+                 'size_mb':round(f.stat().st_size/1_048_576,2),
+                 'action':'KEEP' if i==0 else 'REVIEW -- lower/equal quality duplicate'}
+                for i,f in enumerate(ranked)]})
     return results
 
-
-def report_non_hd(category: str, base_dir: Path) -> list[dict]:
-    """
-    Report any title group where the best available copy is below 720p.
-    Only applies to video-containing categories.
-    """
-    if not base_dir.exists():
-        return []
-    video_files = [f for f in collect_media_files(base_dir)
-                   if f.suffix.lower() in VIDEO_EXTS]
-    groups: dict[tuple, list[dict]] = defaultdict(list)
-
-    for f in video_files:
-        title  = parse_media_title(f.name)
-        season = get_season(f.name) or ''
-        res    = get_resolution(f.name)
-        groups[(title, season)].append({'path': f, 'res': res})
-
+# ---------------------------------------------------------------------------
+# Report 3 -- Duplicates by hash
+# ---------------------------------------------------------------------------
+def report_duplicates_by_hash(cat, base):
+    hmap = defaultdict(list)
+    files = walk_media_files(base); total = len(files)
+    for idx, f in enumerate(files, 1):
+        if total > 0 and idx % 50 == 0:
+            print(f'  [{cat}] hashing {idx}/{total}...', flush=True)
+        hmap[partial_md5(f)].append(f)
     results = []
-    for (title, season), entries in groups.items():
-        best = max(e['res'] for e in entries)
-        if best < 720:
-            results.append({
-                'parsed_title':    title,
-                'season':          season or None,
-                'best_resolution': best or 'unknown',
-                'files': [
-                    {
-                        'file':       str(e['path'].relative_to(MEDIA_ROOT)),
-                        'size_mb':    round(e['path'].stat().st_size / 1_048_576, 2),
-                        'resolution': e['res'] or 'unknown',
-                    }
-                    for e in entries
-                ],
-            })
+    for h, group in hmap.items():
+        if len(group) < 2: continue
+        ranked = sorted(group, key=lambda p: p.stat().st_size, reverse=True)
+        results.append({'hash':h,'category':cat,'file_count':len(group),'files':[
+            {'file':str(f.relative_to(base.parent)),'size_mb':round(f.stat().st_size/1_048_576,2),
+             'action':'KEEP' if i==0 else 'EXACT DUPLICATE -- safe to remove'}
+            for i,f in enumerate(ranked)]})
     return results
 
-
-def report_non_english(category: str, base_dir: Path) -> list[dict]:
-    """
-    Flag files that appear to have no English audio.
-
-    Detection order
-    ---------------
-    1. Non-Latin script characters in the filename.
-    2. Explicit non-English language tags in the filename (and no English tag).
-    3. ffprobe audio-stream metadata (for video and audio files).
-
-    Multi-language files that include an English track are NOT flagged.
-    """
-    if not base_dir.exists():
-        return []
+# ---------------------------------------------------------------------------
+# Report 4 -- Non-HD
+# ---------------------------------------------------------------------------
+def report_non_hd(cat, base):
+    if not CATEGORIES.get(cat,(None,False))[1]: return []
+    groups = defaultdict(list)
+    for f in walk_media_files(base):
+        if f.suffix.lower() not in VIDEO_EXT: continue
+        t = parse_media_title(f.name); s = get_season(f.name) or ''
+        if t: groups[f'{t}|{s}'].append(f)
     results = []
+    for key, files in groups.items():
+        bh = max(resolution_height(parse_resolution(f.name)) for f in files)
+        if bh < MIN_HD_HEIGHT:
+            title, season = key.split('|',1)
+            results.append({'category':cat,'parsed_title':title,'season':season or None,
+                'best_resolution':f'{bh}p' if bh else 'unknown','files':[
+                {'file':str(f.relative_to(base.parent)),'resolution':parse_resolution(f.name),
+                 'size_mb':round(f.stat().st_size/1_048_576,2)} for f in sorted(files,key=lambda p:p.name)]})
+    return results
 
-    for f in collect_media_files(base_dir):
-        reasons = []
-
+# ---------------------------------------------------------------------------
+# Report 5 -- Non-English
+# ---------------------------------------------------------------------------
+def report_non_english(cat, base):
+    results = []
+    for f in walk_media_files(base):
+        is_vid = f.suffix.lower() in VIDEO_EXT
+        is_aud = f.suffix.lower() in AUDIO_EXT
+        if not (is_vid or is_aud): continue
         fn_reason = non_english_filename_reason(f.name)
-        if fn_reason:
-            reasons.append(f'filename: {fn_reason}')
-
-        if f.suffix.lower() in (VIDEO_EXTS | AUDIO_EXTS):
-            if not has_english_audio(f):
-                reasons.append('ffprobe: no English audio track detected')
-
-        if reasons:
-            results.append({
-                'file':    str(f.relative_to(MEDIA_ROOT)),
-                'size_mb': round(f.stat().st_size / 1_048_576, 2),
-                'reasons': reasons,
-            })
+        probe_ok = has_english_audio(f)
+        probe_reason = None
+        if not probe_ok:
+            langs = ffprobe_audio_langs(f)
+            probe_reason = f"Audio tracks: {', '.join(langs) if langs else 'unknown'}"
+        # If filename suggests non-English but probe says English is present, skip
+        if fn_reason and probe_ok: continue
+        if not fn_reason and probe_ok: continue
+        parts = [p for p in [fn_reason, probe_reason] if p]
+        results.append({'category':cat,'file':str(f.relative_to(base.parent)),
+            'size_mb':round(f.stat().st_size/1_048_576,2),
+            'reason':'; '.join(parts) if parts else 'No English audio track detected'})
     return results
-
 
 # ---------------------------------------------------------------------------
 # Report persistence
 # ---------------------------------------------------------------------------
-
-def save_report(name: str, payload: dict) -> Path:
+def save_report(name, payload):
     REPORT_DIR.mkdir(parents=True, exist_ok=True)
-    ts  = datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')
-    out = REPORT_DIR / f"{ts}_{name}.json"
-    with open(out, 'w', encoding='utf-8') as fh:
-        json.dump(payload, fh, indent=2, default=str)
-    print(f'  -> {out}')
+    out = REPORT_DIR / f'{name}.json'
+    with open(out,'w',encoding='utf-8') as fh: json.dump(payload,fh,indent=2,default=str)
+    print(f'  -> saved: {out}', flush=True)
     return out
-
 
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
-
-def main() -> None:
-    sep = '=' * 64
+def main():
+    sep = '='*70
     ts  = datetime.now(timezone.utc).isoformat(timespec='seconds')
-    print(f'\n{sep}')
-    print(f'  arrstack-media-scanner  |  Dry Run  |  {ts}')
-    print(f'{sep}\n')
+    print(f'\n{sep}\n arrstack-media-scanner  v2.0  |  {ts} UTC\n{sep}', flush=True)
+    active_cats = {name: get_category_path(name) for name in CATEGORIES}
+    missing = [n for n,p in active_cats.items() if not p.exists()]
+    if missing: print(f'  [WARN] not found (will skip): {", ".join(missing)}', flush=True)
+    rts = datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')
+    summary = {}
 
-    all_stray       : dict[str, list] = {}
-    all_dup_name    : dict[str, list] = {}
-    all_dup_hash    : dict[str, list] = {}
-    all_non_hd      : dict[str, list] = {}
-    all_non_english : dict[str, list] = {}
+    def _run_check(num, label, check_flag, fn_name, result_key, count_key):
+        if not check_flag:
+            print(f'\n[{num}/5] {label} -- SKIPPED', flush=True); return
+        print(f'\n[{num}/5] {label}...', flush=True)
+        all_results = []
+        for cat, base in active_cats.items():
+            if base.exists():
+                found = fn_name(cat, base); all_results.extend(found)
+                if found: print(f'  {cat}: {len(found)}', flush=True)
+        ts2 = datetime.now(timezone.utc).isoformat(timespec='seconds')
+        payload = {'report': result_key, 'generated': ts2, count_key: len(all_results),
+                   ('items' if count_key=='item_count' else 'groups'): all_results}
+        save_report(f'{rts}_{num}_{result_key}', payload)
+        summary[result_key] = {'count': len(all_results)}
 
-    VIDEO_CATEGORIES = {'shows', 'movies', 'anime', 'music', 'audiobooks'}
+    _run_check('1','Scanning for stray files',CHECK_STRAY_FILES,
+               report_stray_files,'stray_files','item_count')
+    _run_check('2','Scanning for name-based duplicates',CHECK_DUPLICATES_BY_NAME,
+               report_duplicates_by_name,'duplicates_by_name','group_count')
+    _run_check('3','Computing file hashes for exact duplicates',CHECK_DUPLICATES_BY_HASH,
+               report_duplicates_by_hash,'duplicates_by_hash','group_count')
+    _run_check('4','Scanning for non-HD video titles',CHECK_NON_HD,
+               report_non_hd,'non_hd','item_count')
+    _run_check('5','Scanning for non-English audio',CHECK_NON_ENGLISH,
+               report_non_english,'non_english','item_count')
 
-    for category, base_dir in MEDIA_DIRS.items():
-        print(f'[{category.upper()}] {base_dir}')
-        if not base_dir.exists():
-            print(f'  WARNING: directory does not exist — skipping\n')
-            continue
+    print(f'\n{sep}\n SCAN COMPLETE', flush=True)
+    for k,v in summary.items(): print(f'  {k}: {v["count"]} item(s)', flush=True)
+    print(sep, flush=True)
+    print(json.dumps({'event':'done','summary':summary}), flush=True)
 
-        print('  Stray files ...')
-        all_stray[category]     = report_stray_files(category, base_dir)
-
-        print('  Name-based duplicates ...')
-        all_dup_name[category]  = report_duplicates_by_name(category, base_dir)
-
-        print('  Hash-based duplicates ...')
-        all_dup_hash[category]  = report_duplicates_by_hash(category, base_dir)
-
-        if category in VIDEO_CATEGORIES:
-            print('  Non-HD check ...')
-            all_non_hd[category] = report_non_hd(category, base_dir)
-
-        print('  Non-English check ...')
-        all_non_english[category] = report_non_english(category, base_dir)
-
-        counts = {
-            'stray':          len(all_stray.get(category,       [])),
-            'dup_name_groups':len(all_dup_name.get(category,    [])),
-            'dup_hash_groups':len(all_dup_hash.get(category,    [])),
-            'non_hd_titles':  len(all_non_hd.get(category,      [])),
-            'non_english':    len(all_non_english.get(category, [])),
-        }
-        print(f'  Summary: {counts}\n')
-
-    meta = {'generated_utc': ts, 'media_root': str(MEDIA_ROOT)}
-
-    print('Saving reports ...')
-    save_report('1_stray_files',        {**meta, 'categories': all_stray})
-    save_report('2_duplicates_by_name', {**meta, 'categories': all_dup_name})
-    save_report('3_duplicates_by_hash', {**meta, 'categories': all_dup_hash})
-    save_report('4_non_hd',             {**meta, 'categories': all_non_hd})
-    save_report('5_non_english',        {**meta, 'categories': all_non_english})
-
-    print(f'\n{sep}')
-    print('  Scan complete.  All reports are DRY RUN only.')
-    print('  No files were moved, renamed, or deleted.')
-    print(f'{sep}\n')
-
-
-if __name__ == '__main__':
-    main()
+if __name__ == '__main__': main()
